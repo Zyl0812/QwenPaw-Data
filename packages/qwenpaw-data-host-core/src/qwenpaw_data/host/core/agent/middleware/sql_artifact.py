@@ -1,0 +1,114 @@
+# -*- coding: utf-8 -*-
+"""Materialize execute_sql CSV into the session artifact directory."""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from pathlib import Path, PurePath
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable
+
+from agentscope.message import TextBlock, ToolResultState
+from agentscope.middleware import MiddlewareBase
+from agentscope.tool import ToolResponse
+
+from qwenpaw_data.host.core.cm_sql_artifact import (
+    SqlArtifactError,
+    SqlArtifactLogContext,
+    is_execute_sql_tool,
+    materialize_execute_sql_result,
+)
+
+if TYPE_CHECKING:
+    from agentscope.agent import Agent
+
+logger = logging.getLogger(__name__)
+
+_MATERIALIZATION_ERROR = json.dumps(
+    {
+        "error": {
+            "code": "SQL_ARTIFACT_MATERIALIZATION_FAILED",
+            "message": (
+                "SQL executed successfully, but the result CSV could not be "
+                "saved into the session workspace. Do not retry the same query; "
+                "report the failure or continue without the CSV."
+            ),
+        }
+    },
+    ensure_ascii=False,
+)
+
+
+class SqlArtifactMiddleware(MiddlewareBase):
+    """Copy CM execute_sql CSV into the session artifacts before model context."""
+
+    def __init__(
+        self,
+        *,
+        host_artifact_dir: Path,
+        model_artifact_dir: PurePath,
+        session_id: str | None = None,
+    ) -> None:
+        self._host_artifact_dir = host_artifact_dir
+        self._model_artifact_dir = model_artifact_dir
+        self._session_id = session_id
+
+    async def on_acting(  # type: ignore[override]
+        self,
+        agent: Agent,
+        input_kwargs: dict,
+        next_handler: Callable[..., AsyncGenerator],
+    ) -> AsyncGenerator[Any, None]:
+        name = getattr(input_kwargs["tool_call"], "name", "")
+        prefixes = agent._cm_mcp_tool_prefixes
+        context = getattr(agent, "_request_context", {}) or {}
+        token = context.get("access_token")
+        log_context = SqlArtifactLogContext(
+            session_id=self._session_id,
+            backend=context.get("datasource_id"),
+        )
+        async for chunk in next_handler(**input_kwargs):
+            yield await self._rewrite(name, chunk, prefixes, token, log_context)
+
+    async def _rewrite(
+        self,
+        name: str,
+        chunk: Any,
+        prefixes: set[str],
+        token: str | None,
+        log_context: SqlArtifactLogContext,
+    ) -> Any:
+        if not isinstance(chunk, ToolResponse) or not is_execute_sql_tool(
+            name, prefixes
+        ):
+            return chunk
+        if not chunk.content:
+            return chunk
+        first = chunk.content[0]
+        text = getattr(first, "text", None)
+        if not isinstance(text, str):
+            return chunk
+        started = time.monotonic()
+        try:
+            rewritten = await materialize_execute_sql_result(
+                text,
+                artifact_dir=self._host_artifact_dir,
+                model_artifact_dir=self._model_artifact_dir,
+                access_token=token,
+                log_context=log_context,
+            )
+        except SqlArtifactError as exc:
+            logger.error(
+                "execute_sql artifact failed: phase=%s duration_ms=%d "
+                "error_type=%s context=%s",
+                exc.phase,
+                int((time.monotonic() - started) * 1000),
+                type(exc.__cause__ or exc).__name__,
+                log_context,
+            )
+            chunk.content = [TextBlock(type="text", text=_MATERIALIZATION_ERROR)]
+            chunk.state = ToolResultState.ERROR
+            return chunk
+        if rewritten != text:
+            first.text = rewritten
+        return chunk
